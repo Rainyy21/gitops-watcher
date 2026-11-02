@@ -1,0 +1,6 @@
+.env 
+stacks/
+__pycache_/
+.venv/
+
+
