@@ -1,0 +1,13 @@
+services:
+  gitops-watcher:
+    build: .
+    container_name: gitops-watcher
+    restart: unless-stopped
+    environment:
+      CHECK_INTERVAL: 30
+      STACKS_DIR: /opt/gitops
+      CONFIG_PATH: /config/repos.yml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./repos.yml/:config/repos.yml:ro
+      - /opt/gitops:/opt/gitops
