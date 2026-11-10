@@ -4,13 +4,13 @@ RUN apk add --no-cache git docker-cli docker-cli-compose && git config --global 
 
 WORKDIR /app
 
-COPY requirements.txt
+COPY requirements.txt ..
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY watcher.py
+COPY app/watcher.py  .. 
 
-ENV PYTHONUMBUDDERED = 1
+ENV PYTHONUMBUFFERED = 1
 
 CMD ["python", "/app/watcher.py"]
 
