@@ -2,5 +2,6 @@
 stacks/
 __pycache__/
 .venv/
+repos.yml
 
 
