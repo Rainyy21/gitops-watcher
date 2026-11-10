@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -11,6 +12,7 @@ import yaml
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "repos.yml"))
 STACKS_DIR = Path(os.environ.get("STACKS_DIR", "stacks"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
+STATE_PATH = Path(os.environ.get("STATE_PATH", STACKS_DIR / ".state.json"))
 
 
 # --- helpers ---
@@ -22,11 +24,30 @@ def log(name: str, msg: str) -> None:
 def run(cmd: list[str], cwd: Path | None = None) -> str:
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"{' '.join(cmd)} failed:\n{result.stderr.strip()}")
+        msg = f"{' '.join(cmd)} failed:\n{result.stderr.strip()}"
+        raise RuntimeError(redact(msg))
     return result.stdout.strip()
 
 
+def redact(text: str) -> str:
+    return re.sub(r"https://[^@/\s]+@", "https://***@", text)
+
+
 # --- git ---
+
+
+def auth_url(repo: dict) -> str | None:
+    url = repo["url"]
+    token_env = repo.get("token_env")
+    if not token_env:
+        return None
+    token = os.environ.get(token_env)
+    if not token:
+        raise RuntimeError(f"env var {token_env} is not set")
+    if not url.startswith("https://"):
+        raise RuntimeError("token auth only works with https:// URLs")
+
+    return url.replace("https://", f"https://{token}@", 1)
 
 
 def remote_hash(url: str, branch: str) -> str:
@@ -45,7 +66,9 @@ def clone(url: str, path: Path, branch: str) -> None:
     run(["git", "clone", "--branch", branch, "--depth", "1", url, str(path)])
 
 
-def update(path: Path, branch: str) -> None:
+def update(url: str, path: Path, branch: str) -> None:
+    # keep origin in sync with the config, e.g. after a token rotation
+    run(["git", "remote", "set-url", "origin", url], cwd=path)
     # explicit refspec so origin/<branch> exists even if the branch changed since the clone
     refspec = f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
     run(["git", "fetch", "--depth", "1", "origin", refspec], cwd=path)
@@ -63,9 +86,10 @@ def compose(name, *args, path: Path | None = None, compose_file: str | None = No
     return run(cmd + list(args), cwd=path)
 
 
-def deploy(name, path, compose_file):
+def deploy(name, path, compose_file, pull: bool = True):
     log(name, "deploying...")
-    pull_image(name, path, compose_file)
+    if pull:
+        pull_image(name, path, compose_file)
     compose(
         name,
         "up",
@@ -114,20 +138,26 @@ def restart(name, path, compose_file):
 
 # -- core logic ---
 
-# commit hash last deployed per repo, so a failed deploy is retried next check
-deployed: dict[str, str] = {}
 
-
-def check_repo(repo):
+def check_repo(repo, state: dict):
     name = repo["name"]
     path = STACKS_DIR / name
-    url = repo["url"]
-    branch = repo.get("branch", "main")
-    compose_file = repo.get("compose_file")
+    branch = repo["branch"]
+    compose_file = repo["compose_file"]
+    current = state.get(name, {})
 
     try:
+        url = auth_url(repo) or repo["url"]
         remote = remote_hash(url, branch)
-        if deployed.get(name) == remote:
+
+        if current.get("commit") == remote and (path / ".git").exists():
+            # no new commit: refresh images / restart stopped containers.
+            # `up -d` only recreates containers whose image or config changed.
+            if repo["pull_image"]:
+                pull_image(name, path, compose_file)
+            compose(name, "up", "-d", "--remove-orphans", path=path, compose_file=compose_file)
+            if current.get("status") != "ok":
+                record(state, name, status="ok", error=None)
             return
 
         if not (path / ".git").exists():
@@ -138,12 +168,20 @@ def check_repo(repo):
             local = local_hash(path)
             if local != remote:
                 log(name, f"update found {local[:7]} -> {remote[:7]}")
-                update(path, branch)
+                update(url, path, branch)
 
-        deploy(name, path, compose_file)
-        deployed[name] = local_hash(path)
+        deploy(name, path, compose_file, repo["pull_image"])
+        record(
+            state,
+            name,
+            commit=local_hash(path),
+            deployed_at=f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            status="ok",
+            error=None,
+        )
     except Exception as e:
         log(name, f"error: {e}")
+        record(state, name, status="error", error=str(e))
 
 
 # --- config ---
@@ -161,12 +199,41 @@ def normalize(raw: dict, defaults: dict) -> dict:
 
     repo.setdefault("branch", "main")
     repo.setdefault("compose_file", None)
+    repo.setdefault("pull_image", True)
     return repo
+
+
+# --- state ---
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log("watcher", f"state file unreadable, starting fresh: {e}")
+        return {}
+
+
+def save_state(state: dict) -> None:
+    # write to a temp file then rename, so a crash mid-write can't corrupt it
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_PATH)
+
+
+def record(state: dict, name: str, **fields) -> None:
+    state.setdefault(name, {}).update(fields)
+    try:
+        save_state(state)
+    except OSError as e:
+        log("watcher", f"can't save state: {e}")
 
 
 # --- main loop ---
 def main() -> None:
     STACKS_DIR.mkdir(parents=True, exist_ok=True)
+    state = load_state()
     log("watcher", f"started, checking every {CHECK_INTERVAL}s")
 
     while True:
@@ -181,7 +248,7 @@ def main() -> None:
             name = raw.get("name", "?")
             try:
                 repo = normalize(raw, defaults)
-                check_repo(repo)
+                check_repo(repo, state)
             except Exception as e:
                 log(name, f"error: {e}")
         time.sleep(CHECK_INTERVAL)
