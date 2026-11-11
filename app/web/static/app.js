@@ -76,6 +76,7 @@ const api = (path, opts = {}) => fetch(path, {
   ...opts,
   headers: { "X-CSRF-Token": CSRF, "Content-Type": "application/json", ...(opts.headers || {}) },
 }).then(async res => {
+  if (res.status === 401) { location.reload(); throw new Error("logged out"); }  // -> login page
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
   return data;
@@ -332,6 +333,7 @@ document.addEventListener("click", async e => {
     if (document.hidden) return;
     try {
       const res = await fetch("/api/version", { cache: "no-store" });
+      if (res.status === 401 && !anyOpen()) location.reload();  // session expired -> login page
       if (!res.ok) return;
       const { version } = await res.json();
       if (seen === null) seen = version;

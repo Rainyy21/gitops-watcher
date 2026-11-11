@@ -154,12 +154,12 @@
   .field .hint { font-size: 11.5px; color: var(--muted); }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
-  input[type=text], select {
+  input[type=text], input[type=password], select {
     font: inherit; font-size: 13px; color: var(--text);
     background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
     padding: 8px 10px; width: 100%;
   }
-  input[type=text]:focus, select:focus { outline: none; border-color: var(--accent); }
+  input[type=text]:focus, input[type=password]:focus, select:focus { outline: none; border-color: var(--accent); }
   input.invalid { border-color: var(--error); }
 
   .check { display: flex; align-items: flex-start; gap: 10px; font-size: 13px; cursor: pointer; }
@@ -331,3 +331,12 @@ span.commit:hover { text-decoration: none; }
 @keyframes blink { 50% { opacity: 0; } }
 .editor-loading { padding: 16px; color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+
+/* ---------- login ---------- */
+.login { min-height: calc(100vh - 88px); display: flex; align-items: center; justify-content: center; }
+.login .modal { max-width: 360px; }
+.login .modal-head { color: var(--accent); }
+.login .modal-foot .btn { width: 100%; }
+.login-error { color: var(--error); font-size: 13px; }
+.login-note { color: var(--warn); font-size: 12.5px; }
+.logout { display: contents; }

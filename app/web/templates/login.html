@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block title %}log in · gitops-watcher{% endblock %}
+
+{% block content %}
+<main class="login">
+  <form class="modal" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <div class="modal-head">☂ gitops-watcher</div>
+    <div class="modal-body">
+      {% if not configured %}
+        <div class="login-note">login isn't set up: set WEB_ADMIN_USER and WEB_ADMIN_PASSWORD_HASH in .env and recreate the container</div>
+      {% endif %}
+      {% if error %}<div class="login-error" role="alert">{{ error }}</div>{% endif %}
+      <div class="field">
+        <label for="l-user">username</label>
+        <input type="text" id="l-user" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+      </div>
+      <div class="field">
+        <label for="l-pass">password</label>
+        <input type="password" id="l-pass" name="password" autocomplete="current-password" required>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn primary">log in</button>
+    </div>
+  </form>
+</main>
+{% endblock %}
+
+{# app.js drives the dashboard (and reloads it every minute), so it stays off this page #}
+{% block scripts %}{% endblock %}

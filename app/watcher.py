@@ -16,6 +16,7 @@ import yaml
 from ruamel.yaml import YAML
 from ruamel.yaml.error import CommentMark
 from ruamel.yaml.tokens import CommentToken
+from cryptography.fernet import Fernet, InvalidToken
 
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "repos.yml"))
 STACKS_DIR = Path(os.environ.get("STACKS_DIR", "stacks"))
@@ -26,6 +27,11 @@ STATE_PATH = Path(os.environ.get("STATE_PATH", STACKS_DIR / ".state.json"))
 REQUEST_DIR = Path(os.environ.get("REQUEST_DIR", STACKS_DIR / ".requests"))
 # files edited in the website (.env, overrides...), copied into the clone before each deploy
 LOCAL_DIR = Path(os.environ.get("LOCAL_DIR", STACKS_DIR / ".local"))
+
+# encrypts the .env files saved from the website (LOCAL_DIR) at rest; empty = plaintext.
+# generate with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ENV_ENCRYPTION_KEY = os.environ.get("ENV_ENCRYPTION_KEY", "").strip()
+ENC_PREFIX = "gitops-enc:v1:"
 
 # seconds before a command is killed
 GIT_TIMEOUT = int(os.environ.get("GIT_TIMEOUT", "300"))  # clone / fetch
@@ -169,13 +175,87 @@ def compose(
     return run(compose_cmd(name, path, compose_file) + list(args), cwd=path, timeout=timeout)
 
 
+# --- local files (.env encryption) ---
+def is_secret(filename: str) -> bool:
+    return filename == ".env" or filename.endswith(".env")
+
+
+def _fernet() -> Fernet | None:
+    if not ENV_ENCRYPTION_KEY:
+        return None
+    try:
+        return Fernet(ENV_ENCRYPTION_KEY)
+    except ValueError:
+        raise RuntimeError("ENV_ENCRYPTION_KEY is not a valid Fernet key") from None
+
+
+def encrypt_text(text: str) -> str:
+    """Encrypt if a key is set, else leave as is."""
+    f = _fernet()
+    if not f:
+        return text
+    return ENC_PREFIX + f.encrypt(text.encode()).decode() + "\n"
+
+
+def decrypt_text(text: str) -> str:
+    """Plaintext passes through, so files saved before the key was set still work."""
+    if not text.startswith(ENC_PREFIX):
+        return text
+    f = _fernet()
+    if not f:
+        raise RuntimeError("file is encrypted but ENV_ENCRYPTION_KEY is not set")
+    try:
+        return f.decrypt(text[len(ENC_PREFIX) :].strip().encode()).decode()
+    except InvalidToken:
+        raise RuntimeError("can't decrypt: wrong ENV_ENCRYPTION_KEY") from None
+
+
+def read_local(path: Path) -> str:
+    return decrypt_text(path.read_text(encoding="utf-8"))
+
+
+def write_private(path: Path, text: str) -> None:
+    """Atomic write, readable by the owner only."""
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o600)  # in case the .tmp was left over with other permissions
+    os.replace(tmp, path)
+
+
+def encrypt_local_files() -> None:
+    """On start: encrypt .env files that were saved before the key was set."""
+    if not _fernet() or not LOCAL_DIR.is_dir():
+        return
+    for f in LOCAL_DIR.glob("*/*"):
+        if not f.is_file() or not is_secret(f.name):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8")
+            if not text.startswith(ENC_PREFIX):
+                write_private(f, encrypt_text(text))
+                log(f.parent.name, f"encrypted {f.name}")
+        except (OSError, UnicodeDecodeError) as e:
+            log(f.parent.name, f"can't encrypt {f.name}: {e}")
+
+
 def sync_local_files(name: str, path: Path) -> None:
-    """Copy LOCAL_DIR/<name>/* into the clone, so compose sees .env, overrides, etc."""
+    """Copy LOCAL_DIR/<name>/* into the clone, so compose sees .env, overrides, etc.
+    Encrypted files are written decrypted: compose can only read plain .env files."""
     local = LOCAL_DIR / name
     if not local.is_dir() or not path.is_dir():
         return
     for f in local.iterdir():
-        if f.is_file():
+        if not f.is_file():
+            continue
+        if is_secret(f.name):
+            try:
+                text = read_local(f)
+            except RuntimeError as e:  # better to fail the deploy than ship ciphertext as .env
+                raise RuntimeError(f"{f.name}: {e}") from None
+            write_private(path / f.name, text)
+        else:
             shutil.copy2(f, path / f.name)
 
 
@@ -708,6 +788,10 @@ def main() -> None:
         ensure_config()
 
     detect_self()
+    try:
+        encrypt_local_files()
+    except RuntimeError as e:  # bad key: deploys will report it per repo
+        log("watcher", str(e))
 
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)

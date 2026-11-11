@@ -15,35 +15,72 @@ import os
 import re
 import secrets
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
+import threading
+import time
 from pathlib import Path
 
 import yaml
-from flask import (Flask, abort, flash, jsonify, redirect, render_template,
-                   request, session, url_for)
+from flask import (
+    Flask,
+    abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash
 
 # share settings and rules with the watcher (app/watcher.py, one folder up)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from watcher import (CHECK_INTERVAL, CONFIG_PATH, LOCAL_DIR,  # noqa: E402
-                     REQUEST_DIR, STACKS_DIR, STATE_PATH, normalize, queue_request)
+from watcher import (  # noqa: E402
+    CHECK_INTERVAL,
+    CONFIG_PATH,
+    LOCAL_DIR,
+    REQUEST_DIR,
+    STACKS_DIR,
+    STATE_PATH,
+    decrypt_text,
+    encrypt_text,
+    is_secret,
+    normalize,
+    queue_request,
+    read_local,
+)
 
 # ---------- settings ----------
 
-TOKEN_ENVS = [t for t in os.environ.get("TOKEN_ENVS", "GITEA_TOKEN,GITHUB_TOKEN").split(",") if t]
+TOKEN_ENVS = [
+    t for t in os.environ.get("TOKEN_ENVS", "GITEA_TOKEN,GITHUB_TOKEN").split(",") if t
+]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")  # empty = webhooks turned off
+ADMIN_USER = os.environ.get("ADMIN_USER", "")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")  # empty = nobody can log in
 
-MAX_FILE = 256 * 1024                                   # biggest file the editor will open/save
-SAFE_REPO = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")   # compose project names are lowercase
-SAFE_FILE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")      # no slashes = no ../ tricks
+MAX_FILE = 256 * 1024  # biggest file the editor will open/save
+SAFE_REPO = re.compile(
+    r"^[a-z0-9][a-z0-9_-]{0,62}$"
+)  # compose project names are lowercase
+SAFE_FILE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")  # no slashes = no ../ tricks
 SAFE_BRANCH = re.compile(r"^[A-Za-z0-9._/-]{1,100}$")
-SAFE_URL = re.compile(r"^https?://[^\s@]+$")           # no "@" = no tokens pasted into URLs
+SAFE_URL = re.compile(r"^https?://[^\s@]+$")  # no "@" = no tokens pasted into URLs
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE + 64 * 1024
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,  # page scripts can't read the cookie
+    SESSION_COOKIE_SAMESITE="Lax",  # other sites' POSTs don't carry it
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE") == "1",  # set to 1 behind https
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
 
 
 # ---------- reading data ----------
+
 
 def load_json(path: Path, default):
     try:
@@ -68,7 +105,12 @@ def load_repos() -> list[dict]:
     return repos
 
 
-COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+COMPOSE_NAMES = (
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+)
 
 
 def compose_file_of(repo: dict) -> str | None:
@@ -99,6 +141,7 @@ def pending_requests() -> dict[str, str]:
 
 # ---------- writing requests ----------
 
+
 def write_atomic(path: Path, text: str, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -110,6 +153,7 @@ def write_atomic(path: Path, text: str, mode: int | None = None) -> None:
 
 # ---------- files ----------
 
+
 def safe_path(base: Path, filename: str) -> Path:
     """Join base + filename, refusing anything that could escape base."""
     if not SAFE_FILE.match(filename) or filename in (".", ".."):
@@ -118,10 +162,6 @@ def safe_path(base: Path, filename: str) -> Path:
     if path.parent != base.resolve():
         abort(400, "bad file name")
     return path
-
-
-def is_secret(filename: str) -> bool:
-    return filename == ".env" or filename.endswith(".env")
 
 
 def mask(text: str) -> str:
@@ -141,7 +181,7 @@ def env_keys(text: str) -> set[str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         if line.startswith("export "):
-            line = line[len("export "):]
+            line = line[len("export ") :]
         key = line.split("=", 1)[0].strip()
         if key:
             keys.add(key)
@@ -153,14 +193,20 @@ def missing_env(name: str) -> list[str]:
     env = LOCAL_DIR / name / ".env"
     if not example.is_file() or not env.is_file():
         return []
-    return sorted(env_keys(example.read_text()) - env_keys(env.read_text()))
+    try:
+        have = env_keys(read_local(env))
+    except (RuntimeError, OSError, UnicodeDecodeError):  # can't decrypt: the editor says why
+        return []
+    return sorted(env_keys(example.read_text()) - have)
 
 
 def local_files(name: str) -> list[str]:
     folder = LOCAL_DIR / name
     if not folder.is_dir():
         return []
-    return sorted(p.name for p in folder.iterdir() if p.is_file() and SAFE_FILE.match(p.name))
+    return sorted(
+        p.name for p in folder.iterdir() if p.is_file() and SAFE_FILE.match(p.name)
+    )
 
 
 def git_files(repo: dict) -> list[str]:
@@ -171,9 +217,13 @@ def git_files(repo: dict) -> list[str]:
     skip = set(local_files(repo["name"]))
     names = []
     for p in root.iterdir():
-        if (p.is_file() and p.name not in skip and SAFE_FILE.match(p.name)
-                and (not p.name.startswith(".") or p.name == ".env.example")
-                and p.stat().st_size <= MAX_FILE):
+        if (
+            p.is_file()
+            and p.name not in skip
+            and SAFE_FILE.match(p.name)
+            and (not p.name.startswith(".") or p.name == ".env.example")
+            and p.stat().st_size <= MAX_FILE
+        ):
             names.append(p.name)
     compose = compose_file_of(repo)
     return sorted(names, key=lambda n: (n != compose, n.lower()))
@@ -186,7 +236,89 @@ def read_text(path: Path) -> str:
         abort(415, "not a text file")
 
 
+# ---------- login (one admin account from the environment) ----------
+
+PUBLIC = {"login", "static", "webhook"}  # webhooks are checked by their signature
+
+MAX_FAILS = 5  # wrong passwords per IP...
+FAIL_WINDOW = 15 * 60  # ...within this many seconds = locked out until it passes
+_fails: dict[str, list[float]] = {}
+_fails_lock = threading.Lock()
+
+
+def recent_fails(ip: str) -> list[float]:
+    now = time.monotonic()
+    with _fails_lock:
+        _fails[ip] = [t for t in _fails.get(ip, []) if now - t < FAIL_WINDOW]
+        return _fails[ip]
+
+
+def note_fail(ip: str) -> None:
+    with _fails_lock:
+        _fails.setdefault(ip, []).append(time.monotonic())
+
+
+def check_login(user: str, password: str) -> bool:
+    if not ADMIN_USER or not ADMIN_PASSWORD_HASH:
+        return False
+    # always hash, so a wrong username takes as long as a wrong password
+    try:
+        good_pw = check_password_hash(ADMIN_PASSWORD_HASH, password)
+    except ValueError:  # not a werkzeug hash (e.g. the .env.example placeholder)
+        return False
+    return secrets.compare_digest(user, ADMIN_USER) and good_pw
+
+
+def safe_next(target: str | None) -> str:
+    """Only follow redirects back into this site."""
+    if target and target.startswith("/") and not target.startswith(("//", "/\\")):
+        return target
+    return url_for("index")
+
+
+# registered before check_csrf, so an expired session goes to the login page
+# instead of a "bad CSRF token" error
+@app.before_request
+def require_login():
+    if request.endpoint in PUBLIC or session.get("user"):
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify(error="not logged in"), 401
+    nxt = request.full_path.rstrip("?") if request.method == "GET" else None
+    return redirect(url_for("login", next=nxt))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user"):
+        return redirect(url_for("index"))
+    configured = bool(ADMIN_USER and ADMIN_PASSWORD_HASH)
+    error = None
+    if request.method == "POST":
+        ip = request.remote_addr or "?"
+        if len(recent_fails(ip)) >= MAX_FAILS:
+            error = "too many attempts, try again in a few minutes"
+        elif check_login(request.form.get("username", ""), request.form.get("password", "")):
+            nxt = safe_next(request.args.get("next"))
+            session.clear()  # fresh session (and CSRF token) for the logged-in user
+            session.permanent = True
+            session["user"] = ADMIN_USER
+            return redirect(nxt)
+        else:
+            note_fail(ip)
+            error = "wrong username or password"
+    status = 429 if error and error.startswith("too many") else 401 if error else 200
+    return render_template("login.html", error=error, configured=configured), status
+
+
+@app.post("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 # ---------- CSRF (stops other websites from clicking your buttons) ----------
+
 
 def csrf_token() -> str:
     if "csrf" not in session:
@@ -203,7 +335,9 @@ def check_csrf():
     if request.method == "POST" and not request.path.startswith("/webhook/"):
         sent = request.form.get("csrf") or request.headers.get("X-CSRF-Token") or ""
         expected = session.get("csrf", "")
-        if not expected or not secrets.compare_digest(sent, expected):   # no session = no token = reject
+        if not expected or not secrets.compare_digest(
+            sent, expected
+        ):  # no session = no token = reject
             abort(400, "invalid or missing CSRF token: reload the page and try again")
 
 
@@ -219,6 +353,7 @@ def api_errors(e):
 
 
 # ---------- template helpers ----------
+
 
 @app.template_filter("ago")
 def ago(iso: str | None) -> str:
@@ -259,23 +394,35 @@ def index():
         status = "paused" if repo["paused"] else info.get("status", "new")
         if status not in ORDER:
             status = "error"
-        rows.append({
-            "name": name,
-            "status": status,
-            "commit": (info.get("commit") or "")[:7],
-            "last_check": info.get("last_check"),
-            "last_deploy": info.get("last_deploy"),
-            "error": info.get("error") if status == "error" else None,
-            "missing_env": missing_env(name),
-            "busy": pending.get(name),
-        })
+        rows.append(
+            {
+                "name": name,
+                "status": status,
+                "commit": (info.get("commit") or "")[:7],
+                "last_check": info.get("last_check"),
+                "last_deploy": info.get("last_deploy"),
+                "error": info.get("error") if status == "error" else None,
+                "missing_env": missing_env(name),
+                "busy": pending.get(name),
+            }
+        )
 
     # repos that are queued to be added but not in repos.yml yet
     known = {r["name"] for r in rows}
     for name, action in pending.items():
         if action == "add" and name not in known:
-            rows.append({"name": name, "status": "new", "commit": "", "last_check": None,
-                         "last_deploy": None, "error": None, "missing_env": [], "busy": "add"})
+            rows.append(
+                {
+                    "name": name,
+                    "status": "new",
+                    "commit": "",
+                    "last_check": None,
+                    "last_deploy": None,
+                    "error": None,
+                    "missing_env": [],
+                    "busy": "add",
+                }
+            )
 
     rows.sort(key=lambda r: (ORDER[r["status"]], r["name"]))
 
@@ -288,12 +435,21 @@ def index():
         next_in = max(0, int(CHECK_INTERVAL - since))
         stale = since > CHECK_INTERVAL * 2 + 60
 
-    return render_template("index.html", rows=rows, counts=counts, total=len(rows),
-                           next_in=next_in, stale=stale, last_round=last_round,
-                           interval=CHECK_INTERVAL, token_envs=TOKEN_ENVS)
+    return render_template(
+        "index.html",
+        rows=rows,
+        counts=counts,
+        total=len(rows),
+        next_in=next_in,
+        stale=stale,
+        last_round=last_round,
+        interval=CHECK_INTERVAL,
+        token_envs=TOKEN_ENVS,
+    )
 
 
 # ---------- actions (all become request files) ----------
+
 
 @app.post("/repos/<name>/<action>")
 def repo_action(name: str, action: str):
@@ -322,14 +478,17 @@ def add_repo():
     f = request.form
     name = f.get("name", "").strip()
     url = f.get("url", "").strip()
-    branch = f.get("branch", "").strip()              # empty = repos.yml default
+    branch = f.get("branch", "").strip()  # empty = repos.yml default
     compose_file = f.get("compose_file", "").strip()  # empty = let compose find it
     token_env = f.get("token_env", "").strip()
 
     problems = []
     if not SAFE_REPO.match(name):
         problems.append("name: lowercase letters, numbers, - and _ only")
-    elif any(r["name"] == name for r in load_repos()) or pending_requests().get(name) == "add":
+    elif (
+        any(r["name"] == name for r in load_repos())
+        or pending_requests().get(name) == "add"
+    ):
         problems.append(f"a repo named {name} already exists")
     if not SAFE_URL.match(url):
         problems.append("url: must be http(s) with no username or token in it")
@@ -352,7 +511,7 @@ def add_repo():
     if token_env:
         entry["token_env"] = token_env
     if f.get("pull_image") != "on":
-        entry["pull_image"] = False   # the watcher's default is True
+        entry["pull_image"] = False  # the watcher's default is True
     if f.get("deploy_now") != "on":
         entry["paused"] = True
 
@@ -363,26 +522,35 @@ def add_repo():
 
 # ---------- file editor API (used by app.js) ----------
 
+
 @app.get("/api/version")
 def version():
     """A cheap fingerprint of everything the dashboard shows.
     The page polls this and reloads only when it changes."""
+
     def mtime(p: Path) -> int:
         try:
             return p.stat().st_mtime_ns
         except OSError:
             return 0
+
     pending = pending_requests()
     raw = f"{mtime(STATE_PATH)}|{mtime(Path(CONFIG_PATH))}|{sorted(pending.items())}"
-    return jsonify(version=hashlib.sha1(raw.encode()).hexdigest()[:16], busy=bool(pending))
+    return jsonify(
+        version=hashlib.sha1(raw.encode()).hexdigest()[:16], busy=bool(pending)
+    )
 
 
 @app.get("/api/repos/<name>/files")
 def list_files(name: str):
     repo = get_repo(name)
     local = local_files(name)
-    return jsonify(local=local, git=git_files(repo), compose_file=compose_file_of(repo),
-                   missing_env=missing_env(name))
+    return jsonify(
+        local=local,
+        git=git_files(repo),
+        compose_file=compose_file_of(repo),
+        missing_env=missing_env(name),
+    )
 
 
 @app.get("/api/repos/<name>/files/<kind>/<filename>")
@@ -401,9 +569,17 @@ def read_file(name: str, kind: str, filename: str):
         abort(404, "file not found")
     text = read_text(path)
     secret = is_secret(filename)
+    if kind == "local" and secret:
+        try:
+            text = decrypt_text(text)
+        except RuntimeError as e:
+            return jsonify(error=f"{filename}: {e}"), 500
     reveal = request.args.get("reveal") == "1"
-    return jsonify(content=mask(text) if secret and not reveal else text,
-                   secret=secret, masked=secret and not reveal)
+    return jsonify(
+        content=mask(text) if secret and not reveal else text,
+        secret=secret,
+        masked=secret and not reveal,
+    )
 
 
 @app.post("/api/repos/<name>/files/<filename>")
@@ -425,33 +601,47 @@ def save_file(name: str, filename: str):
 
     path = safe_path(LOCAL_DIR / name, filename)
     is_new = not path.exists()
-    shadows = is_new and filename in git_files(repo)   # check BEFORE writing: git_files hides local names
-    write_atomic(path, content, mode=0o600 if is_secret(filename) else 0o644)
+    shadows = is_new and filename in git_files(
+        repo
+    )  # check BEFORE writing: git_files hides local names
+    if is_secret(filename):
+        try:
+            content = encrypt_text(content)
+        except RuntimeError as e:  # bad key: refuse rather than save plaintext
+            return jsonify(error=str(e)), 500
+        write_atomic(path, content, mode=0o600)
+    else:
+        write_atomic(path, content, mode=0o644)
 
     if data.get("redeploy"):
         queue_request("deploy", name)
     return jsonify(ok=True, missing_env=missing_env(name), shadows_git=shadows)
 
 
-
 # ---------- webhooks (GitHub / Gitea call this on every push) ----------
+
 
 def valid_signature(body: bytes) -> bool:
     """GitHub sends X-Hub-Signature-256: sha256=<hex>, Gitea sends X-Gitea-Signature: <hex>."""
     if not WEBHOOK_SECRET:
         return False
     expected = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    sent = (request.headers.get("X-Hub-Signature-256", "").removeprefix("sha256=")
-            or request.headers.get("X-Gitea-Signature", ""))
+    sent = request.headers.get("X-Hub-Signature-256", "").removeprefix(
+        "sha256="
+    ) or request.headers.get("X-Gitea-Signature", "")
     return bool(sent) and hmac.compare_digest(sent, expected)
 
 
 @app.post("/webhook/<name>")
 def webhook(name: str):
-    if not valid_signature(request.get_data()):   # before get_repo, so strangers can't probe repo names
+    if not valid_signature(
+        request.get_data()
+    ):  # before get_repo, so strangers can't probe repo names
         abort(403, "bad or missing signature")
     repo = get_repo(name)
-    event = request.headers.get("X-GitHub-Event") or request.headers.get("X-Gitea-Event")
+    event = request.headers.get("X-GitHub-Event") or request.headers.get(
+        "X-Gitea-Event"
+    )
     if event == "ping":
         return jsonify(ok=True, msg="pong")
     if event != "push":
@@ -461,8 +651,8 @@ def webhook(name: str):
         return jsonify(ok=True, ignored=f"push to {ref}")
     if repo["paused"]:
         return jsonify(ok=True, ignored="paused")
-    if name not in pending_requests():            # 5 quick pushes = 1 check
-        queue_request("check", name)              # deploys if the branch has a new commit
+    if name not in pending_requests():  # 5 quick pushes = 1 check
+        queue_request("check", name)  # deploys if the branch has a new commit
     return jsonify(ok=True, queued="check"), 202
 
 

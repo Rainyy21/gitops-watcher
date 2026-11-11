@@ -18,6 +18,10 @@
       {% endif %}
     </div>
     <button class="btn primary" data-open="#add-modal" data-focus="#f-name">+ add repo</button>
+    <form class="logout" method="post" action="{{ url_for('logout') }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <button class="btn" title="log out {{ session.user }}">log out</button>
+    </form>
   </div>
 </header>
 
