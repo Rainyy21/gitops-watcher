@@ -181,13 +181,14 @@ def process_requests(state: dict) -> None:
 #         if repo["paused"]:
 #             continue
 #
-#  c) so the website reacts fast: wait in short steps and wake up early
-#     when a request file shows up. Replace the end-of-round wait with:
+#  c) so the website and webhooks react fast: wait_for_next_round() already
+#     wakes up early via has_requests(), but only for the CLI's REQUEST_DIR.
+#     Make it look at the website's folder too:
 #
-#         deadline = time.monotonic() + max(0, CHECK_INTERVAL - elapsed)
-#         while not STOP.is_set() and time.monotonic() < deadline:
-#             if any(REQUESTS_DIR.glob("*.json")):
-#                 break
-#             STOP.wait(2)
+#         def has_requests() -> bool:
+#             return any(d.is_dir() and any(d.glob("*.json"))
+#                        for d in (REQUEST_DIR, REQUESTS_DIR))
 #
+#     Only do this together with (a): if nothing deletes the files in
+#     REQUESTS_DIR, the watcher would wake up every second forever.
 #     (a full round then runs: requests first, then the normal checks)

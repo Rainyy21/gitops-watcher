@@ -38,6 +38,7 @@ services:
       REQUESTS_DIR: /data/requests
       TOKEN_ENVS: GITEA_TOKEN,GITHUB_TOKEN   # names only, for the add-repo dropdown
       SECRET_KEY: ${WEB_SECRET_KEY}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}       # same value goes in the GitHub/Gitea webhook settings
     volumes:
       # NO docker socket: the website can't run containers, only ask the watcher
       - ./config:/config:ro

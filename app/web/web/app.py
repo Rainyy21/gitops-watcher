@@ -8,6 +8,8 @@ Runs as its own container. It never touches Docker: it only
   - WRITES  local files   (data/local/<repo>) -> .env, overrides, etc.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -29,6 +31,7 @@ LOCAL_DIR = Path(os.environ.get("LOCAL_DIR", "data/local"))
 REQUESTS_DIR = Path(os.environ.get("REQUESTS_DIR", "data/requests"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 TOKEN_ENVS = [t for t in os.environ.get("TOKEN_ENVS", "GITEA_TOKEN,GITHUB_TOKEN").split(",") if t]
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")  # empty = webhooks turned off
 
 MAX_FILE = 256 * 1024                                   # biggest file the editor will open/save
 SAFE_REPO = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")   # compose project names are lowercase
@@ -194,18 +197,21 @@ app.jinja_env.globals["csrf_token"] = csrf_token
 
 @app.before_request
 def check_csrf():
-    if request.method == "POST":
+    # webhooks can't send our token; they're checked by their HMAC signature instead
+    if request.method == "POST" and not request.path.startswith("/webhook/"):
         sent = request.form.get("csrf") or request.headers.get("X-CSRF-Token") or ""
-        if not secrets.compare_digest(sent, session.get("csrf", "")):
+        expected = session.get("csrf", "")
+        if not expected or not secrets.compare_digest(sent, expected):   # no session = no token = reject
             abort(400, "invalid or missing CSRF token: reload the page and try again")
 
 
 @app.errorhandler(400)
+@app.errorhandler(403)
 @app.errorhandler(404)
 @app.errorhandler(413)
 @app.errorhandler(415)
 def api_errors(e):
-    if request.path.startswith("/api/"):
+    if request.path.startswith(("/api/", "/webhook/")):
         return jsonify(error=e.description), e.code
     return e
 
@@ -405,6 +411,39 @@ def save_file(name: str, filename: str):
     if data.get("redeploy"):
         queue_request("deploy", name)
     return jsonify(ok=True, missing_env=missing_env(name), shadows_git=shadows)
+
+
+
+# ---------- webhooks (GitHub / Gitea call this on every push) ----------
+
+def valid_signature(body: bytes) -> bool:
+    """GitHub sends X-Hub-Signature-256: sha256=<hex>, Gitea sends X-Gitea-Signature: <hex>."""
+    if not WEBHOOK_SECRET:
+        return False
+    expected = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    sent = (request.headers.get("X-Hub-Signature-256", "").removeprefix("sha256=")
+            or request.headers.get("X-Gitea-Signature", ""))
+    return bool(sent) and hmac.compare_digest(sent, expected)
+
+
+@app.post("/webhook/<name>")
+def webhook(name: str):
+    if not valid_signature(request.get_data()):   # before get_repo, so strangers can't probe repo names
+        abort(403, "bad or missing signature")
+    repo = get_repo(name)
+    event = request.headers.get("X-GitHub-Event") or request.headers.get("X-Gitea-Event")
+    if event == "ping":
+        return jsonify(ok=True, msg="pong")
+    if event != "push":
+        return jsonify(ok=True, ignored=f"event {event}")
+    ref = (request.get_json(silent=True) or {}).get("ref", "")
+    if ref != f"refs/heads/{repo['branch']}":
+        return jsonify(ok=True, ignored=f"push to {ref}")
+    if repo["paused"]:
+        return jsonify(ok=True, ignored="paused")
+    if name not in pending_requests():            # 5 quick pushes = 1 deploy
+        queue_request("deploy", name)
+    return jsonify(ok=True, queued="deploy"), 202
 
 
 if __name__ == "__main__":
