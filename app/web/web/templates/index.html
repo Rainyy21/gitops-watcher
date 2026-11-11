@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+
+{% block title %}{% if counts.error %}({{ counts.error }}) {% endif %}gitops-watcher{% endblock %}
+
+{% block content %}
+<header class="topbar">
+  <div class="brand">☂ gitops-watcher <span>/ stacks</span></div>
+  <div class="top-right">
+    <div class="heartbeat">
+      {% if not last_round %}
+        <span class="dot warn"></span><span>waiting for the watcher's first round…</span>
+      {% elif stale %}
+        <span class="dot warn"></span>
+        <span style="color:var(--warn)">watcher may be stuck · last check <b style="color:var(--warn)" title="{{ last_round|pretty }}">{{ last_round|ago }}</b></span>
+      {% else %}
+        <span class="dot ok"></span>
+        <span>watcher up · next check in <b id="countdown" data-seconds="{{ next_in }}">…</b></span>
+      {% endif %}
+    </div>
+    <button class="btn primary" data-open="#add-modal" data-focus="#f-name">+ add repo</button>
+  </div>
+</header>
+
+<section class="summary">
+  <div class="stat"><div class="label">repos</div><div class="value">{{ total }}</div></div>
+  <div class="stat"><div class="label">ok</div><div class="value ok">{{ counts.ok }}</div></div>
+  <div class="stat {{ 'dim' if not counts.error }}"><div class="label">error</div><div class="value error">{{ counts.error }}</div></div>
+  <div class="stat {{ 'dim' if not counts.paused }}"><div class="label">paused</div><div class="value paused">{{ counts.paused }}</div></div>
+</section>
+
+<section class="panel">
+  {% if rows %}
+  <table>
+    <thead>
+      <tr>
+        <th>repo</th><th>status</th><th>commit</th><th>last check</th><th>last deploy</th>
+        <th class="actions-h">actions</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      {% set warn = r.missing_env and r.status != 'error' and not r.busy %}
+      <tr class="repo {{ 'has-error' if r.status == 'error' and not r.busy }} {{ 'is-paused' if r.status == 'paused' }} {{ 'has-warn' if warn }}">
+        <td class="name-cell">
+          <button class="linkish" data-files="{{ r.name }}" title="view & edit files"><span class="name">{{ r.name }}</span></button>
+        </td>
+        <td data-label="status"><span>
+          {% if r.busy %}
+            <span class="status busy"><span class="dot busy"></span>queued · {{ r.busy }}</span>
+          {% elif r.status == 'new' %}
+            <span class="status new"><span class="dot new"></span>waiting</span>
+          {% else %}
+            <span class="status {{ r.status }}"><span class="dot {{ r.status }}"></span>{{ r.status }}</span>
+          {% endif %}
+          {% if warn %}<span class="warn-pill" title=".env is missing keys">⚠ .env</span>{% endif %}
+        </span></td>
+        <td data-label="commit">{% if r.commit %}<span class="commit">{{ r.commit }}</span>{% else %}<span class="time">-</span>{% endif %}</td>
+        <td data-label="last check"><span class="time" title="{{ r.last_check|pretty }}">{{ r.last_check|ago }}</span></td>
+        <td data-label="last deploy"><span class="time" title="{{ r.last_deploy|pretty }}">{{ r.last_deploy|ago }}</span></td>
+        <td class="actions-cell">
+          {% if r.busy != 'add' %}
+          <div class="actions">
+            <button class="btn icon" data-files="{{ r.name }}" title="view & edit files">✎ files</button>
+            {% if r.status != 'paused' %}
+              <form method="post" action="{{ url_for('repo_action', name=r.name, action='deploy') }}">
+                <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+                <button class="btn icon" {{ 'disabled' if r.busy }} title="redeploy now">↻ deploy</button>
+              </form>
+              <form method="post" action="{{ url_for('repo_action', name=r.name, action='stop') }}">
+                <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+                <button class="btn icon" {{ 'disabled' if r.busy }} title="stop and pause">■ stop</button>
+              </form>
+            {% else %}
+              <form method="post" action="{{ url_for('repo_action', name=r.name, action='start') }}">
+                <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+                <button class="btn icon" {{ 'disabled' if r.busy }} title="start">▶ start</button>
+              </form>
+            {% endif %}
+            <button class="btn icon danger" data-remove="{{ r.name }}" {{ 'disabled' if r.busy }} title="remove">✕</button>
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% if r.status == 'error' and r.error and not r.busy %}
+      <tr class="error-row"><td colspan="6"><span class="tree">└─ </span>{{ r.error }}</td></tr>
+      {% endif %}
+      {% if warn %}
+      <tr class="warn-row"><td colspan="6"><span class="tree">└─ </span>.env is missing {{ r.missing_env|length }} key{{ 's' if r.missing_env|length > 1 }} from .env.example:
+        {% for k in r.missing_env %}<code>{{ k }}</code>{{ ", " if not loop.last }}{% endfor %}
+        <button class="fix" data-files="{{ r.name }}">fix in .env →</button></td></tr>
+      {% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <div class="empty-state">
+      <div class="big">no repos yet<span class="cursor">_</span></div>
+      <div>add one with <b>+ add repo</b>, or edit repos.yml</div>
+    </div>
+  {% endif %}
+</section>
+
+<div class="footer">
+  <span>actions are queued and run on the watcher's next round</span>
+  <span>polling every {{ interval }}s · auto-refresh 30s</span>
+</div>
+{% endblock %}
+
+
+{% block overlays %}
+<!-- ADD REPO -->
+<div class="backdrop" id="add-modal" role="dialog" aria-modal="true" aria-labelledby="add-title">
+  <form class="modal" method="post" action="{{ url_for('add_repo') }}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <div class="modal-head" id="add-title">add repo</div>
+    <div class="modal-body">
+      <div class="field">
+        <label for="f-name">name</label>
+        <input type="text" id="f-name" name="name" placeholder="my-app" required pattern="[a-z0-9][a-z0-9_\-]*">
+        <span class="hint">lowercase · used as the compose project name and clone folder</span>
+      </div>
+      <div class="field">
+        <label for="f-url">git url</label>
+        <input type="text" id="f-url" name="url" placeholder="https://gitea.yourdomain.com/you/my-app.git" required>
+        <span class="hint">never paste a token into the url, pick one below instead</span>
+      </div>
+      <div class="row2">
+        <div class="field"><label for="f-branch">branch</label><input type="text" id="f-branch" name="branch" value="main"></div>
+        <div class="field"><label for="f-compose">compose file</label><input type="text" id="f-compose" name="compose_file" value="docker-compose.yml"></div>
+      </div>
+      <div class="field">
+        <label for="f-token">token</label>
+        <select id="f-token" name="token_env">
+          <option value="">none (public repo)</option>
+          {% for t in token_envs %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+        </select>
+        <span class="hint">only the env var name is saved, never the token itself</span>
+      </div>
+      <label class="check">
+        <input type="checkbox" name="pull_images">
+        <span>auto-update images<span class="sub">pull newer versions of <code>image:</code> services each round</span></span>
+      </label>
+      <label class="check">
+        <input type="checkbox" name="deploy_now" checked>
+        <span>deploy now<span class="sub">clone and start on the next round (otherwise add as paused)</span></span>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="btn" data-close>cancel</button>
+      <button type="submit" class="btn primary">add repo</button>
+    </div>
+  </form>
+</div>
+
+<!-- REMOVE -->
+<div class="backdrop" id="remove-modal" role="dialog" aria-modal="true" aria-labelledby="rm-title">
+  <form class="modal danger" method="post" id="remove-form" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <div class="modal-head" id="rm-title">remove <span class="rm-name"></span></div>
+    <div class="modal-body">
+      <p class="note" style="margin:0">
+        this stops the stack (<code>docker compose down</code>), deletes its entry from
+        <code>repos.yml</code>, and deletes the clone folder.
+      </p>
+      <label class="check danger">
+        <input type="checkbox" name="wipe" id="rm-wipe">
+        <span>also delete volumes + local files
+          <span class="sub warn-text">permanently wipes this stack's data, including databases and its .env</span>
+        </span>
+      </label>
+      <div class="field">
+        <label for="rm-confirm">type <span class="confirm-name rm-name"></span> to confirm</label>
+        <input type="text" name="confirm" id="rm-confirm">
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="btn" data-close>cancel</button>
+      <button type="submit" class="btn danger solid" id="rm-submit" disabled>remove</button>
+    </div>
+  </form>
+</div>
+
+<!-- FILE DRAWER -->
+<div class="backdrop drawer-bd" id="files-drawer" role="dialog" aria-modal="true" aria-labelledby="fd-title">
+  <div class="drawer">
+    <div class="drawer-head">
+      <div class="title" id="fd-title"><span id="fd-repo"></span> <span>/ files</span></div>
+      <button class="btn icon" data-close aria-label="close">✕ close</button>
+    </div>
+    <div class="drawer-main">
+      <nav class="file-list" id="fd-list"></nav>
+      <section class="editor-pane">
+        <div class="editor-bar">
+          <span class="fname" id="fd-fname"></span>
+          <span id="fd-badges"></span>
+        </div>
+        <div id="fd-banner"></div>
+        <div id="fd-warn"></div>
+        <div class="code">
+          <div class="gutter" id="fd-gutter">1</div>
+          <textarea id="fd-text" spellcheck="false" aria-label="file contents"></textarea>
+        </div>
+        <div class="drawer-foot">
+          <span class="state" id="fd-state"></span>
+          <div class="btns" id="fd-btns">
+            <button class="btn" id="fd-discard" disabled>discard</button>
+            <button class="btn" id="fd-save" disabled>save</button>
+            <button class="btn primary" id="fd-save-deploy" disabled>save + redeploy</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+{% endblock %}
