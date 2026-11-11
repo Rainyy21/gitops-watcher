@@ -320,6 +320,7 @@ def remove_stack(name: str, state: dict) -> bool:
 # The helper isn't part of the stack, so it survives the restart.
 SELF_UPDATE = os.environ.get("SELF_UPDATE", "").lower() in ("1", "true", "yes")
 SELF_DIR = Path(os.environ.get("SELF_DIR", "/self"))  # the checkout, mounted read-only
+SELF_REMOTE = os.environ.get("SELF_REMOTE", "origin")  # git remote in the checkout to update from
 UPDATER = "gitops-watcher-updater"
 
 # project:  compose project we run in (never managed as a repo, see main())
@@ -375,7 +376,7 @@ def check_self() -> None:
 
     try:
         branch = git_self("rev-parse", "--abbrev-ref", "HEAD")
-        remote = remote_hash(git_self("remote", "get-url", "origin"), branch)
+        remote = remote_hash(git_self("remote", "get-url", SELF_REMOTE), branch)
         local = git_self("rev-parse", "HEAD")
         dirty = git_self("status", "--porcelain", "--untracked-files=no")
     except Exception as e:
@@ -384,12 +385,12 @@ def check_self() -> None:
     if remote == SELF["running"] or remote == SELF.get("tried"):
         return  # up to date, or this commit already failed once
     if dirty:
-        note(f"{branch} has {remote[:7]}, but the checkout has uncommitted changes: not updating")
+        note(f"{SELF_REMOTE}/{branch} has {remote[:7]}, but the checkout has uncommitted changes: not updating")
         return
     if local != remote:
         try:  # remote is behind us = unpushed commits
             git_self("merge-base", "--is-ancestor", remote, local)
-            note(f"the checkout has commits not pushed to {branch}: not updating")
+            note(f"the checkout has commits not pushed to {SELF_REMOTE}/{branch}: not updating")
             return
         except Exception:
             pass  # behind (or diverged: `pull --ff-only` will refuse)
@@ -405,7 +406,7 @@ def check_self() -> None:
     owner = SELF_DIR.stat()
     docker_gid = os.stat("/var/run/docker.sock").st_gid
     host_dir = SELF["host_dir"]
-    script = (f"git pull --ff-only origin {shlex.quote(branch)} && "
+    script = (f"git pull --ff-only {shlex.quote(SELF_REMOTE)} {shlex.quote(branch)} && "
               f"docker compose -p {shlex.quote(SELF['project'])} up -d --build")
     try:
         run([

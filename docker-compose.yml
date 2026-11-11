@@ -26,6 +26,7 @@ services:
       # pull + rebuild this stack when its own branch gets a new commit
       # (only when the checkout is clean; see check_self() in app/watcher.py)
       SELF_UPDATE: "true"
+      SELF_REMOTE: gitea  # which remote of this checkout to follow (git remote -v)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/self:ro  # this checkout, to compare its commit with the remote
