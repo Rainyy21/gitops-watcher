@@ -4,3 +4,5 @@
 stacks/
 repos.yml
 **/__pycache__
+data/
+config/
