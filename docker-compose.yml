@@ -3,6 +3,7 @@ services:
     build: .
     container_name: gitops-watcher
     restart: unless-stopped
+    stop_grace_period: 5m  # let a running deploy finish on `docker stop`
     env_file: .env
     environment:
       CHECK_INTERVAL: 30
@@ -10,5 +11,5 @@ services:
       CONFIG_PATH: /config/repos.yml
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./repos.yml:/config/repos.yml:ro
+      - ./repos.yml:/config/repos.yml  # writable, for `cli.py add/remove`
       - /opt/gitops:/opt/gitops
