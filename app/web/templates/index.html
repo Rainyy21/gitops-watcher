@@ -125,8 +125,8 @@
         <span class="hint">never paste a token into the url, pick one below instead</span>
       </div>
       <div class="row2">
-        <div class="field"><label for="f-branch">branch</label><input type="text" id="f-branch" name="branch" value="main"></div>
-        <div class="field"><label for="f-compose">compose file</label><input type="text" id="f-compose" name="compose_file" value="docker-compose.yml"></div>
+        <div class="field"><label for="f-branch">branch</label><input type="text" id="f-branch" name="branch" placeholder="default (main)"></div>
+        <div class="field"><label for="f-compose">compose file</label><input type="text" id="f-compose" name="compose_file" placeholder="auto-detect"></div>
       </div>
       <div class="field">
         <label for="f-token">token</label>
@@ -137,7 +137,7 @@
         <span class="hint">only the env var name is saved, never the token itself</span>
       </div>
       <label class="check">
-        <input type="checkbox" name="pull_images">
+        <input type="checkbox" name="pull_image" checked>
         <span>auto-update images<span class="sub">pull newer versions of <code>image:</code> services each round</span></span>
       </label>
       <label class="check">

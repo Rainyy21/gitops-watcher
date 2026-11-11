@@ -7,19 +7,21 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
-from ruamel.yaml import YAML
-from ruamel.yaml.error import CommentMark
-from ruamel.yaml.tokens import CommentToken
-
 from watcher import (
     CONFIG_PATH,
     NAME_RE,
     STACKS_DIR,
+    append_entry,
+    compose_cmd,
+    delete_entry,
+    find_index,
     load_config,
+    load_config_rt,
     load_state,
     normalize,
     redact,
     request_check,
+    save_config_rt,
 )
 
 app = typer.Typer(help="control the gitops-watcher.")
@@ -72,60 +74,6 @@ def find_repo(name: str, quiet: bool = False) -> dict | None:
     if quiet:
         return None
     fail(f"no repo named '{name}' in {CONFIG_PATH}")
-
-
-# round-trip YAML keeps comments and layout when add/remove edit repos.yml
-rt_yaml = YAML()
-rt_yaml.indent(mapping=2, sequence=4, offset=2)
-rt_yaml.preserve_quotes = True
-
-
-def load_config_rt():
-    try:
-        with CONFIG_PATH.open() as f:
-            return rt_yaml.load(f) or {}
-    except FileNotFoundError:
-        return {}
-
-
-def save_config_rt(data) -> None:
-    # write in place (no temp file + rename): repos.yml is a single-file bind
-    # mount in docker, and replacing the file would detach it from the container
-    with CONFIG_PATH.open("w") as f:
-        rt_yaml.dump(data, f)
-
-
-# ruamel stores the blank lines/comments *after* a list entry on that entry's
-# last key, so they have to be moved by hand when entries are added or removed
-def _trailing(entry):
-    tok = entry.ca.items.get(list(entry.keys())[-1])
-    return tok[2] if tok and len(tok) > 2 else None
-
-
-def _set_trailing(entry, token) -> None:
-    tok = entry.ca.items.setdefault(list(entry.keys())[-1], [None, None, None, None])
-    tok[2] = token
-
-
-def append_entry(repos, entry: dict) -> None:
-    """Append with a blank line before it, like the hand-written entries."""
-    if repos and _trailing(repos[-1]) is None:
-        _set_trailing(repos[-1], CommentToken("\n\n", CommentMark(0), None))
-    repos.append(entry)
-
-
-def delete_entry(repos, idx: int) -> None:
-    """Delete an entry, keeping the comment that sits above the entry after it."""
-    after = _trailing(repos[idx])
-    if idx > 0:
-        _set_trailing(repos[idx - 1], after)
-    elif after is not None:
-        text = "\n".join(
-            l.strip().lstrip("#").strip() for l in after.value.splitlines() if l.strip()
-        )
-        if text:
-            repos.yaml_set_start_comment(text, indent=2)
-    del repos[idx]
 
 
 def config_names() -> list[str] | None:
@@ -277,10 +225,7 @@ def logs(
     else:
         compose_file = load_state().get(name, {}).get("compose_file")
 
-    cmd = ["docker", "compose", "-p", name]
-    if compose_file:
-        cmd += ["-f", compose_file]
-    cmd += ["logs", "--tail", str(tail)]
+    cmd = compose_cmd(name, path, compose_file) + ["logs", "--tail", str(tail)]
     if follow:
         cmd.append("--follow")
     # not captured: output streams straight to the terminal
@@ -298,7 +243,8 @@ def check(
     wait: bool = typer.Option(False, "--wait", help="Wait for the result."),
 ):
     """Ask the watcher to check a repo now."""
-    find_repo(name)  # exits if it isn't in repos.yml
+    if find_repo(name)["paused"]:  # find_repo exits if it isn't in repos.yml
+        fail(f"'{name}' is paused in {CONFIG_PATH}; unpause it first (or use Start in the website)")
     before = load_state().get(name, {}).get("last_check")
     request_check(name, force)
     console.print(f"requested a check of [cyan]{name}[/cyan]" + (" (forced redeploy)" if force else ""))
@@ -338,10 +284,8 @@ def add(
         fail("token auth only works with https:// URLs")
 
     data = load_config_rt()
-    repos = data.get("repos")
-    if repos is None:
-        repos = data["repos"] = []
-    if any(isinstance(r, dict) and r.get("name") == name for r in repos):
+    repos = data["repos"]
+    if find_index(repos, name) is not None:
         fail(f"'{name}' is already in {CONFIG_PATH}")
 
     # only write what was given, so the entry inherits from `defaults`
@@ -367,11 +311,8 @@ def remove(
 ):
     """Remove a repo from repos.yml."""
     data = load_config_rt()
-    repos = data.get("repos") or []
-    idx = next(
-        (i for i, r in enumerate(repos) if isinstance(r, dict) and r.get("name") == name),
-        None,
-    )
+    repos = data["repos"]
+    idx = find_index(repos, name)
     if idx is None:
         fail(f"no repo named '{name}' in {CONFIG_PATH}")
 

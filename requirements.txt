@@ -2,3 +2,5 @@ pyyaml
 ruamel.yaml
 typer
 rich
+flask
+gunicorn

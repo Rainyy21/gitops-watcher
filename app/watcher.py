@@ -2,7 +2,9 @@ import base64
 import json
 import os
 import re
+import shlex
 import shutil
+import socket
 import subprocess
 import time
 import signal
@@ -11,13 +13,19 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.error import CommentMark
+from ruamel.yaml.tokens import CommentToken
 
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "repos.yml"))
 STACKS_DIR = Path(os.environ.get("STACKS_DIR", "stacks"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 STATE_PATH = Path(os.environ.get("STATE_PATH", STACKS_DIR / ".state.json"))
-# `cli.py check` drops a file here to make the watcher check a repo right away
+# the CLI and the website drop request files here (check / deploy / stop / ...);
+# the watcher wakes up, handles them, and deletes them
 REQUEST_DIR = Path(os.environ.get("REQUEST_DIR", STACKS_DIR / ".requests"))
+# files edited in the website (.env, overrides...), copied into the clone before each deploy
+LOCAL_DIR = Path(os.environ.get("LOCAL_DIR", STACKS_DIR / ".local"))
 
 # seconds before a command is killed
 GIT_TIMEOUT = int(os.environ.get("GIT_TIMEOUT", "300"))  # clone / fetch
@@ -133,6 +141,23 @@ def update(path: Path, branch: str, env: dict | None = None) -> None:
 # --- docker ---
 
 
+OVERRIDES = ("compose.override.yaml", "compose.override.yml",
+             "docker-compose.override.yaml", "docker-compose.override.yml")
+
+
+def compose_cmd(name: str, path: Path | None, compose_file: str | None) -> list[str]:
+    """docker compose -p <name> [-f <file> [-f <override>]]"""
+    cmd = ["docker", "compose", "-p", name]
+    if compose_file:
+        cmd += ["-f", compose_file]
+        # compose only auto-loads an override file when no -f is given, so add it ourselves
+        for override in OVERRIDES:
+            if path is not None and (path / override).is_file():
+                cmd += ["-f", override]
+                break
+    return cmd
+
+
 def compose(
     name,
     *args,
@@ -141,14 +166,22 @@ def compose(
     timeout: float = COMPOSE_TIMEOUT,
 ):
     """Build and run: docker compose -p <name> [-f <file>] <args...>"""
-    cmd = ["docker", "compose", "-p", name]
-    if compose_file:
-        cmd += ["-f", compose_file]
-    return run(cmd + list(args), cwd=path, timeout=timeout)
+    return run(compose_cmd(name, path, compose_file) + list(args), cwd=path, timeout=timeout)
+
+
+def sync_local_files(name: str, path: Path) -> None:
+    """Copy LOCAL_DIR/<name>/* into the clone, so compose sees .env, overrides, etc."""
+    local = LOCAL_DIR / name
+    if not local.is_dir() or not path.is_dir():
+        return
+    for f in local.iterdir():
+        if f.is_file():
+            shutil.copy2(f, path / f.name)
 
 
 def deploy(name, path, compose_file, pull: bool = True):
     log(name, "deploying...")
+    sync_local_files(name, path)
     if pull:
         pull_image(name, path, compose_file)
     compose(
@@ -239,6 +272,7 @@ def check_repo(repo, state: dict) -> dict:
     if current.get("commit") == remote and cloned:
         # no new commit: refresh images / restart stopped containers.
         # `up -d` only recreates containers whose image or config changed.
+        sync_local_files(name, path)
         if repo["pull_image"]:
             pull_image(name, path, compose_file)
         compose(
@@ -271,11 +305,125 @@ def remove_stack(name: str, state: dict) -> bool:
     path = STACKS_DIR / name
     if path.exists():
         try:
-            stop(name, path, state[name].get("compose_file"))
+            stop(name, path, state.get(name, {}).get("compose_file"))
         except Exception as e:
             log(name, f"removed from config but can't stop it, will retry: {e}")
             return False
     return True
+
+
+# --- self-update ---
+#
+# The watcher can't `docker compose up` its own stack: Docker would stop it halfway.
+# So when its own repo has a new commit, it starts a one-off helper container that
+# runs `git pull` + `docker compose up -d --build` in the checkout on the host.
+# The helper isn't part of the stack, so it survives the restart.
+SELF_UPDATE = os.environ.get("SELF_UPDATE", "").lower() in ("1", "true", "yes")
+SELF_DIR = Path(os.environ.get("SELF_DIR", "/self"))  # the checkout, mounted read-only
+UPDATER = "gitops-watcher-updater"
+
+# project:  compose project we run in (never managed as a repo, see main())
+# host_dir: where the checkout is on the host;  image: our own image
+# running:  commit we were started from;  tried: last commit an update was started for
+SELF: dict = {}
+
+
+def git_self(*args, timeout: float = 10) -> str:
+    return run(["git", "-C", str(SELF_DIR), *args], timeout=timeout)
+
+
+def detect_self() -> None:
+    """Read our compose project and checkout path from our own container's labels."""
+    try:
+        info = json.loads(run(["docker", "inspect", socket.gethostname()]))[0]
+    except Exception as e:
+        log("self", f"can't inspect own container: {e}")
+        return
+    labels = info.get("Config", {}).get("Labels") or {}
+    SELF["project"] = labels.get("com.docker.compose.project")
+    SELF["host_dir"] = labels.get("com.docker.compose.project.working_dir")
+    SELF["image"] = info.get("Config", {}).get("Image")
+    if not SELF_UPDATE:
+        return
+    if not (SELF_DIR / ".git").exists() or not SELF["host_dir"]:
+        log("self", f"self-update off: checkout not mounted at {SELF_DIR}")
+        return
+    try:
+        SELF["running"] = git_self("rev-parse", "HEAD")
+    except Exception as e:
+        log("self", f"self-update off: {e}")
+        return
+    log("self", f"self-update on, running {SELF['running'][:7]} from {SELF['host_dir']}")
+    # tell about a failed update from before the restart
+    try:
+        code = run(["docker", "inspect", "-f", "{{.State.ExitCode}}", UPDATER])
+        if code != "0":
+            log("self", f"last self-update failed (exit {code}): docker logs {UPDATER}")
+    except Exception:
+        pass
+
+
+def check_self() -> None:
+    """Start the updater if the watcher's own branch has a commit we aren't running."""
+    if not SELF.get("running"):
+        return
+
+    def note(msg: str) -> None:  # log each skip reason once, not every round
+        if SELF.get("note") != msg:
+            log("self", msg)
+            SELF["note"] = msg
+
+    try:
+        branch = git_self("rev-parse", "--abbrev-ref", "HEAD")
+        remote = remote_hash(git_self("remote", "get-url", "origin"), branch)
+        local = git_self("rev-parse", "HEAD")
+        dirty = git_self("status", "--porcelain", "--untracked-files=no")
+    except Exception as e:
+        note(f"can't check for updates: {e}")
+        return
+    if remote == SELF["running"] or remote == SELF.get("tried"):
+        return  # up to date, or this commit already failed once
+    if dirty:
+        note(f"{branch} has {remote[:7]}, but the checkout has uncommitted changes: not updating")
+        return
+    if local != remote:
+        try:  # remote is behind us = unpushed commits
+            git_self("merge-base", "--is-ancestor", remote, local)
+            note(f"the checkout has commits not pushed to {branch}: not updating")
+            return
+        except Exception:
+            pass  # behind (or diverged: `pull --ff-only` will refuse)
+
+    try:
+        state = run(["docker", "inspect", "-f", "{{.State.Running}}", UPDATER])
+        if state == "true":
+            return  # an update is already running
+        run(["docker", "rm", UPDATER])
+    except RuntimeError:
+        pass  # no old updater
+
+    owner = SELF_DIR.stat()
+    docker_gid = os.stat("/var/run/docker.sock").st_gid
+    host_dir = SELF["host_dir"]
+    script = (f"git pull --ff-only origin {shlex.quote(branch)} && "
+              f"docker compose -p {shlex.quote(SELF['project'])} up -d --build")
+    try:
+        run([
+            "docker", "run", "-d", "--name", UPDATER,
+            # as the checkout's owner, so pulled files aren't root-owned
+            "--user", f"{owner.st_uid}:{owner.st_gid}", "--group-add", str(docker_gid),
+            "-e", "HOME=/tmp", "-e", "GIT_TERMINAL_PROMPT=0",
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",
+            "-v", f"{host_dir}:{host_dir}", "-w", host_dir,
+            "--entrypoint", "sh", SELF["image"], "-c", script,
+        ], timeout=60)
+    except Exception as e:
+        note(f"can't start the updater: {e}")
+        return
+    SELF["tried"] = remote
+    SELF["note"] = None
+    log("self", f"updating to {remote[:7]}, the watcher restarts in a moment "
+                f"(progress: docker logs -f {UPDATER})")
 
 
 # --- config ---
@@ -300,7 +448,88 @@ def normalize(raw, defaults: dict) -> dict:
     repo.setdefault("branch", "main")
     repo.setdefault("compose_file", None)
     repo.setdefault("pull_image", True)
+    repo.setdefault("paused", False)
     return repo
+
+
+def ensure_config() -> None:
+    """Create an empty repos.yml on first start, so there's something to add repos to."""
+    if CONFIG_PATH.exists():
+        return
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(
+        "# repos the watcher deploys. Add with `cli.py add` or the website.\n"
+        "defaults:\n  branch: main\n\nrepos: []\n"
+    )
+    log("watcher", f"created empty {CONFIG_PATH}")
+
+
+# round-trip YAML keeps comments and layout when repos.yml is edited by code
+rt_yaml = YAML()
+rt_yaml.indent(mapping=2, sequence=4, offset=2)
+rt_yaml.preserve_quotes = True
+
+
+def load_config_rt():
+    try:
+        with CONFIG_PATH.open() as f:
+            data = rt_yaml.load(f)
+    except FileNotFoundError:
+        data = None
+    if data is None:
+        data = rt_yaml.load("repos: []\n")
+    if data.get("repos") is None:
+        data["repos"] = rt_yaml.load("[]")
+    return data
+
+
+def save_config_rt(data) -> None:
+    # write in place (no temp file + rename): keeps the file's owner/permissions on the
+    # host, and still works if repos.yml is bind-mounted as a single file
+    with CONFIG_PATH.open("w") as f:
+        rt_yaml.dump(data, f)
+
+
+def find_index(repos, name: str) -> int | None:
+    return next(
+        (i for i, r in enumerate(repos) if isinstance(r, dict) and r.get("name") == name),
+        None,
+    )
+
+
+# ruamel stores the blank lines/comments *after* a list entry on that entry's
+# last key, so they have to be moved by hand when entries are added or removed
+def _trailing(entry):
+    tok = entry.ca.items.get(list(entry.keys())[-1])
+    return tok[2] if tok and len(tok) > 2 else None
+
+
+def _set_trailing(entry, token) -> None:
+    tok = entry.ca.items.setdefault(list(entry.keys())[-1], [None, None, None, None])
+    tok[2] = token
+
+
+def append_entry(repos, entry: dict) -> None:
+    """Append with a blank line before it, like the hand-written entries."""
+    if hasattr(repos, "fa"):
+        repos.fa.set_block_style()  # `repos: []` would otherwise stay on one line
+    if repos and hasattr(repos[-1], "ca") and _trailing(repos[-1]) is None:
+        _set_trailing(repos[-1], CommentToken("\n\n", CommentMark(0), None))
+    repos.append(entry)
+
+
+def delete_entry(repos, idx: int) -> None:
+    """Delete an entry, keeping the comment that sits above the entry after it."""
+    after = _trailing(repos[idx]) if hasattr(repos[idx], "ca") else None
+    if idx > 0 and hasattr(repos[idx - 1], "ca"):
+        _set_trailing(repos[idx - 1], after)
+    elif after is not None:
+        text = "\n".join(
+            l.strip().lstrip("#").strip() for l in after.value.splitlines() if l.strip()
+        )
+        if text:
+            repos.yaml_set_start_comment(text, indent=2)
+    del repos[idx]
 
 
 # --- state ---
@@ -327,32 +556,133 @@ def record(state: dict, name: str, **fields) -> None:
     state.setdefault(name, {}).update(fields)
 
 
-# --- check requests (from cli.py) ---
-def request_check(name: str, force: bool = False) -> None:
+# --- requests (from cli.py and the website) ---
+#
+# A request is a JSON file in REQUEST_DIR: {"action": ..., "repo": <name>, ...}
+#   check   clear the retry backoff; the round then deploys if there's a new commit
+#   deploy  like check, but redeploy even if nothing changed
+#   stop    pause the repo in repos.yml and `docker compose down` it
+#   start   unpause it; the round brings it back up
+#   add     append {"entry": {...}} to repos.yml
+#   remove  `docker compose down` (+ volumes and files if "wipe_volumes"), drop from repos.yml
+ACTIONS = ("check", "deploy", "stop", "start", "add", "remove")
+
+
+def queue_request(action: str, repo: str, **extra) -> None:
+    req = {"action": action, "repo": repo,
+           "created": datetime.now().isoformat(timespec="seconds"), **extra}
     REQUEST_DIR.mkdir(parents=True, exist_ok=True)
-    (REQUEST_DIR / f"{name}.json").write_text(json.dumps({"force": force}))
+    path = REQUEST_DIR / f"{time.time_ns()}-{action}-{repo}.json"
+    # write then rename, so the watcher never reads a half-written file
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(req, indent=2))
+    tmp.replace(path)
+
+
+def request_check(name: str, force: bool = False) -> None:
+    queue_request("deploy" if force else "check", name)
 
 
 def has_requests() -> bool:
     return REQUEST_DIR.is_dir() and any(REQUEST_DIR.glob("*.json"))
 
 
-def apply_requests(state: dict) -> None:
-    """Clear backoff for requested repos (and the deployed commit, if forced)."""
-    if not REQUEST_DIR.is_dir():
+def set_paused(name: str, paused: bool) -> None:
+    data = load_config_rt()
+    idx = find_index(data["repos"], name)
+    if idx is None:
+        raise RuntimeError(f"no repo named {name!r} in {CONFIG_PATH}")
+    if paused:
+        data["repos"][idx]["paused"] = True
+    else:
+        data["repos"][idx].pop("paused", None)
+    save_config_rt(data)
+
+
+def handle_request(req: dict, state: dict) -> None:
+    action = req.get("action")
+    name = str(req.get("repo") or "")
+    if action not in ACTIONS:
+        raise RuntimeError(f"unknown action {action!r}")
+    if not NAME_RE.match(name):
+        raise RuntimeError(f"invalid repo name {name!r}")
+    if name == SELF.get("project") and action != "add":
+        raise RuntimeError(f"{name} is the watcher's own stack, it can't {action} itself")
+    log(name, f"request: {action}")
+
+    if action == "add":
+        entry = req.get("entry")
+        if not isinstance(entry, dict) or entry.get("name") != name:
+            raise RuntimeError("add request has no valid entry")
+        config = load_config()
+        normalize(entry, config.get("defaults") or {})  # raises if invalid
+        data = load_config_rt()
+        if find_index(data["repos"], name) is not None:
+            raise RuntimeError(f"{name} is already in {CONFIG_PATH}")
+        append_entry(data["repos"], entry)
+        save_config_rt(data)
+        log(name, "added; deploys this round" + (" (paused)" if entry.get("paused") else ""))
         return
-    for f in REQUEST_DIR.glob("*.json"):
-        name = f.stem
-        try:
-            force = json.loads(f.read_text() or "{}").get("force", False)
-        except (json.JSONDecodeError, OSError):
-            force = False
-        f.unlink(missing_ok=True)
-        log(name, "check requested" + (" (forced redeploy)" if force else ""))
+
+    config = load_config()
+    raw = next((r for r in config.get("repos") or []
+                if isinstance(r, dict) and r.get("name") == name), None)
+    if raw is None:
+        raise RuntimeError(f"no repo named {name!r} in {CONFIG_PATH}")
+    repo = normalize(raw, config.get("defaults") or {})
+    path = STACKS_DIR / name
+
+    if action in ("check", "deploy", "start"):
+        if action == "start":
+            set_paused(name, False)
         if name in state:
             record(state, name, failed_commit=None, retry_at=None)
-            if force:
-                state[name].pop("commit", None)
+            if action == "deploy":
+                state[name].pop("commit", None)  # forces a redeploy this round
+
+    elif action == "stop":
+        set_paused(name, True)
+        if path.exists():
+            stop(name, path, repo["compose_file"])
+        record(state, name, status="paused", error=None)
+
+    elif action == "remove":
+        wipe = bool(req.get("wipe_volumes"))
+        if path.exists():
+            log(name, "stopping...")
+            compose(name, "down", "--remove-orphans", *(["-v"] if wipe else []),
+                    path=path, compose_file=repo["compose_file"])
+        data = load_config_rt()
+        idx = find_index(data["repos"], name)
+        if idx is not None:
+            delete_entry(data["repos"], idx)
+            save_config_rt(data)
+        if wipe:
+            shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(LOCAL_DIR / name, ignore_errors=True)
+        state.pop(name, None)
+        log(name, "removed" + (" (volumes and files deleted)" if wipe else ""))
+
+
+def process_requests(state: dict) -> None:
+    """Handle every queued request, oldest first. Each file is deleted once handled."""
+    if not REQUEST_DIR.is_dir():
+        return
+    for f in sorted(REQUEST_DIR.glob("*.json")):
+        req = None
+        try:
+            req = json.loads(f.read_text() or "{}")
+            if not isinstance(req, dict):
+                raise RuntimeError("request is not a JSON object")
+            handle_request(req, state)
+        except Exception as e:
+            name = req.get("repo") if isinstance(req, dict) else None
+            log(str(name or f.name), f"request failed: {e}")
+            if name in state:
+                record(state, name, status="error", error=f"request failed: {e}",
+                       last_check=datetime.now().isoformat(timespec="seconds"))
+        finally:
+            f.unlink(missing_ok=True)
 
 
 def wait_for_next_round(seconds: float) -> None:
@@ -367,15 +697,23 @@ def wait_for_next_round(seconds: float) -> None:
 # --- main loop ---
 def main() -> None:
     STACKS_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REQUEST_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
     log("watcher", f"started, checking every {CHECK_INTERVAL}s")
+    # only on a fresh install: if stacks are running and repos.yml went missing,
+    # an empty one would make the watcher stop all of them
+    if not state:
+        ensure_config()
+
+    detect_self()
 
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
     while not STOP.is_set():
         round_start = time.time()
-        apply_requests(state)
+        process_requests(state)
         checked = deployed = errors = 0
         try:
             config = load_config()
@@ -411,6 +749,27 @@ def main() -> None:
             seen.add(name)
 
             now = datetime.now().isoformat(timespec="seconds")
+            if name == SELF.get("project"):
+                # deploying/stopping it would stop the watcher itself mid-way
+                msg = "this is the watcher's own stack: remove it from repos.yml (it updates itself)"
+                if state.get(name, {}).get("error") != msg:
+                    log(name, msg)
+                record(state, name, status="error", error=msg, last_check=now)
+                continue
+            if repo["paused"]:
+                # paused by hand in repos.yml (the stop request already did this): bring it down once
+                if state.get(name, {}).get("status") != "paused":
+                    path = STACKS_DIR / name
+                    try:
+                        if path.exists():
+                            stop(name, path, repo["compose_file"])
+                        record(state, name, status="paused", error=None, last_check=now)
+                    except Exception as e:
+                        errors += 1
+                        log(name, f"paused but can't stop it: {e}")
+                        record(state, name, status="error", error=str(e), last_check=now)
+                continue
+
             checked += 1
             try:
                 result = check_repo(repo, state)
@@ -463,7 +822,7 @@ def main() -> None:
         # entry (a typo can't take a stack down) or when stopping mid-loop
         # (`seen` would be incomplete).
         if config_ok and not STOP.is_set():
-            for old in [n for n in state if n not in seen]:
+            for old in [n for n in state if n not in seen and n != SELF.get("project")]:
                 if remove_stack(old, state):
                     log(old, "removed from config, stack stopped")
                     del state[old]
@@ -482,6 +841,9 @@ def main() -> None:
                 f"round done: {checked} repos, {deployed} deployed, "
                 f"{errors} errors ({elapsed:.1f}s)",
             )
+
+        if not STOP.is_set():
+            check_self()
 
         try:
             save_state(state)

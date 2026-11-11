@@ -1,15 +1,58 @@
+# Layout on the host (next to this file):
+#   config/repos.yml   which repos to deploy (created empty on first start)
+#   data/state.json    what the watcher last did
+#   data/requests/     buttons / webhooks / `cli.py check` drop files here
+#   data/local/<repo>/ files edited in the website (.env, overrides), copied into the clone
+#   /opt/gitops/<repo> the clones the stacks run from
+
+x-paths: &paths
+  STACKS_DIR: /opt/gitops
+  CONFIG_PATH: /config/repos.yml
+  STATE_PATH: /data/state.json
+  REQUEST_DIR: /data/requests
+  LOCAL_DIR: /data/local
+  CHECK_INTERVAL: 60
+
 services:
   gitops-watcher:
     build: .
+    image: gitops-watcher
     container_name: gitops-watcher
     restart: unless-stopped
     stop_grace_period: 5m  # let a running deploy finish on `docker stop`
     env_file: .env
     environment:
-      CHECK_INTERVAL: 30
-      STACKS_DIR: /opt/gitops
-      CONFIG_PATH: /config/repos.yml
+      <<: *paths
+      # pull + rebuild this stack when its own branch gets a new commit
+      # (only when the checkout is clean; see check_self() in app/watcher.py)
+      SELF_UPDATE: "true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./repos.yml:/config/repos.yml  # writable, for `cli.py add/remove`
+      - .:/self:ro  # this checkout, to compare its commit with the remote
+      # a folder, not the single file: Docker would create a *directory* named
+      # repos.yml if the file didn't exist yet
+      - ./config:/config
+      - ./data:/data
       - /opt/gitops:/opt/gitops
+
+  gitops-web:
+    image: gitops-watcher  # same image, built by the service above
+    container_name: gitops-web
+    depends_on: [gitops-watcher]
+    restart: unless-stopped
+    command: ["gunicorn", "--workers", "1", "--threads", "4", "--bind", "0.0.0.0:5000",
+              "--chdir", "/app/web", "app:app"]
+    ports:
+      - "8088:5000"  # LAN only until there's a login in front (e.g. an NPM access list)
+    environment:
+      <<: *paths
+      TOKEN_ENVS: GITEA_TOKEN,GITHUB_TOKEN  # names only, for the add-repo dropdown
+      SECRET_KEY: ${WEB_SECRET_KEY}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}     # same value goes in the GitHub/Gitea webhook settings
+    volumes:
+      # NO docker socket: the website can't run containers, only ask the watcher
+      - ./config:/config:ro
+      - ./data:/data:ro                 # reads state.json...
+      - ./data/local:/data/local        # ...but only writes local files
+      - ./data/requests:/data/requests  # ...and requests
+      - /opt/gitops:/opt/gitops:ro      # reads the clones to show repo files

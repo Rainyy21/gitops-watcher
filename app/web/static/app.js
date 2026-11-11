@@ -323,8 +323,28 @@ document.addEventListener("click", async e => {
   } catch (err) { toast(esc(err.message), "error"); }
 });
 
-/* ---------- auto-refresh (skipped while a dialog or the editor is open) ---------- */
-setInterval(() => { if (!anyOpen()) location.reload(); }, 30000);
+/* ---------- live refresh (skipped while a dialog or the editor is open) ----------
+   poll a tiny fingerprint of state.json / repos.yml / queued requests every 2s
+   and reload as soon as the watcher has acted, instead of waiting for a timer */
+(function () {
+  let seen = null, changed = false;
+  async function poll() {
+    if (document.hidden) return;
+    try {
+      const res = await fetch("/api/version", { cache: "no-store" });
+      if (!res.ok) return;
+      const { version } = await res.json();
+      if (seen === null) seen = version;
+      else if (version !== seen) changed = true;
+    } catch { return; }
+    if (changed && !anyOpen()) location.reload();
+  }
+  poll();
+  setInterval(poll, 2000);
+  document.addEventListener("visibilitychange", poll);
+  // still refresh now and then so the "x min ago" times stay current
+  setInterval(() => { if (!anyOpen()) location.reload(); }, 60000);
+})();
 
 /* ---------- countdown ---------- */
 (function () {

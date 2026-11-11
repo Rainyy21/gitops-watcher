@@ -14,7 +14,7 @@ import json
 import os
 import re
 import secrets
-import time
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -22,14 +22,13 @@ import yaml
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                    request, session, url_for)
 
-# ---------- settings (same env vars as the watcher) ----------
+# share settings and rules with the watcher (app/watcher.py, one folder up)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from watcher import (CHECK_INTERVAL, CONFIG_PATH, LOCAL_DIR,  # noqa: E402
+                     REQUEST_DIR, STACKS_DIR, STATE_PATH, normalize, queue_request)
 
-STATE_PATH = Path(os.environ.get("STATE_PATH", "data/state.json"))
-CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "repos.yml"))
-STACKS_DIR = Path(os.environ.get("STACKS_DIR", "stacks"))
-LOCAL_DIR = Path(os.environ.get("LOCAL_DIR", "data/local"))
-REQUESTS_DIR = Path(os.environ.get("REQUESTS_DIR", "data/requests"))
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
+# ---------- settings ----------
+
 TOKEN_ENVS = [t for t in os.environ.get("TOKEN_ENVS", "GITEA_TOKEN,GITHUB_TOKEN").split(",") if t]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")  # empty = webhooks turned off
 
@@ -54,7 +53,7 @@ def load_json(path: Path, default):
 
 
 def load_repos() -> list[dict]:
-    """repos.yml entries with defaults filled in (same rules as the watcher's normalize)."""
+    """repos.yml entries with defaults filled in, by the watcher's own normalize()."""
     try:
         config = yaml.safe_load(CONFIG_PATH.read_text()) or {}
     except (OSError, yaml.YAMLError):
@@ -62,12 +61,22 @@ def load_repos() -> list[dict]:
     defaults = config.get("defaults") or {}
     repos = []
     for raw in config.get("repos") or []:
-        if not isinstance(raw, dict) or not raw.get("name"):
-            continue
-        repo = {"branch": "main", "compose_file": "docker-compose.yml",
-                "pull_images": False, "paused": False, **defaults, **raw}
-        repos.append(repo)
+        try:
+            repos.append(normalize(raw, defaults))
+        except ValueError:
+            continue  # the watcher skips (and logs) invalid entries too
     return repos
+
+
+COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+
+
+def compose_file_of(repo: dict) -> str | None:
+    """The compose file the watcher uses: the configured one, or what compose would auto-detect."""
+    if repo["compose_file"]:
+        return repo["compose_file"]
+    root = STACKS_DIR / repo["name"]
+    return next((n for n in COMPOSE_NAMES if (root / n).is_file()), None)
 
 
 def get_repo(name: str) -> dict:
@@ -80,8 +89,8 @@ def get_repo(name: str) -> dict:
 def pending_requests() -> dict[str, str]:
     """{repo name: action} for requests the watcher hasn't processed yet."""
     pending = {}
-    if REQUESTS_DIR.is_dir():
-        for f in sorted(REQUESTS_DIR.glob("*.json")):
+    if REQUEST_DIR.is_dir():
+        for f in sorted(REQUEST_DIR.glob("*.json")):
             req = load_json(f, None)
             if isinstance(req, dict) and req.get("repo"):
                 pending.setdefault(req["repo"], req.get("action", "?"))
@@ -97,13 +106,6 @@ def write_atomic(path: Path, text: str, mode: int | None = None) -> None:
     if mode is not None:
         os.chmod(tmp, mode)
     os.replace(tmp, path)
-
-
-def queue_request(action: str, repo: str, **extra) -> None:
-    req = {"action": action, "repo": repo,
-           "created": datetime.now().isoformat(timespec="seconds"), **extra}
-    name = f"{time.time_ns()}-{action}-{repo}.json"
-    write_atomic(REQUESTS_DIR / name, json.dumps(req, indent=2))
 
 
 # ---------- files ----------
@@ -173,7 +175,7 @@ def git_files(repo: dict) -> list[str]:
                 and (not p.name.startswith(".") or p.name == ".env.example")
                 and p.stat().st_size <= MAX_FILE):
             names.append(p.name)
-    compose = repo["compose_file"]
+    compose = compose_file_of(repo)
     return sorted(names, key=lambda n: (n != compose, n.lower()))
 
 
@@ -320,8 +322,8 @@ def add_repo():
     f = request.form
     name = f.get("name", "").strip()
     url = f.get("url", "").strip()
-    branch = f.get("branch", "").strip() or "main"
-    compose_file = f.get("compose_file", "").strip() or "docker-compose.yml"
+    branch = f.get("branch", "").strip()              # empty = repos.yml default
+    compose_file = f.get("compose_file", "").strip()  # empty = let compose find it
     token_env = f.get("token_env", "").strip()
 
     problems = []
@@ -331,9 +333,9 @@ def add_repo():
         problems.append(f"a repo named {name} already exists")
     if not SAFE_URL.match(url):
         problems.append("url: must be http(s) with no username or token in it")
-    if not SAFE_BRANCH.match(branch):
+    if branch and not SAFE_BRANCH.match(branch):
         problems.append("branch name has invalid characters")
-    if not SAFE_FILE.match(compose_file):
+    if compose_file and not SAFE_FILE.match(compose_file):
         problems.append("compose file must be a plain file name")
     if token_env and token_env not in TOKEN_ENVS:
         problems.append("unknown token")
@@ -342,11 +344,15 @@ def add_repo():
             flash(p, "error")
         return redirect(url_for("index"))
 
-    entry = {"name": name, "url": url, "branch": branch, "compose_file": compose_file}
+    entry = {"name": name, "url": url}
+    if branch:
+        entry["branch"] = branch
+    if compose_file:
+        entry["compose_file"] = compose_file
     if token_env:
         entry["token_env"] = token_env
-    if f.get("pull_images") == "on":
-        entry["pull_images"] = True
+    if f.get("pull_image") != "on":
+        entry["pull_image"] = False   # the watcher's default is True
     if f.get("deploy_now") != "on":
         entry["paused"] = True
 
@@ -357,11 +363,25 @@ def add_repo():
 
 # ---------- file editor API (used by app.js) ----------
 
+@app.get("/api/version")
+def version():
+    """A cheap fingerprint of everything the dashboard shows.
+    The page polls this and reloads only when it changes."""
+    def mtime(p: Path) -> int:
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return 0
+    pending = pending_requests()
+    raw = f"{mtime(STATE_PATH)}|{mtime(Path(CONFIG_PATH))}|{sorted(pending.items())}"
+    return jsonify(version=hashlib.sha1(raw.encode()).hexdigest()[:16], busy=bool(pending))
+
+
 @app.get("/api/repos/<name>/files")
 def list_files(name: str):
     repo = get_repo(name)
     local = local_files(name)
-    return jsonify(local=local, git=git_files(repo), compose_file=repo["compose_file"],
+    return jsonify(local=local, git=git_files(repo), compose_file=compose_file_of(repo),
                    missing_env=missing_env(name))
 
 
@@ -441,9 +461,9 @@ def webhook(name: str):
         return jsonify(ok=True, ignored=f"push to {ref}")
     if repo["paused"]:
         return jsonify(ok=True, ignored="paused")
-    if name not in pending_requests():            # 5 quick pushes = 1 deploy
-        queue_request("deploy", name)
-    return jsonify(ok=True, queued="deploy"), 202
+    if name not in pending_requests():            # 5 quick pushes = 1 check
+        queue_request("check", name)              # deploys if the branch has a new commit
+    return jsonify(ok=True, queued="check"), 202
 
 
 if __name__ == "__main__":

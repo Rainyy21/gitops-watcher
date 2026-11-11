@@ -8,7 +8,8 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app/watcher.py app/cli.py ./
+# watcher.py + cli.py, and web/ for the gitops-web service (same image)
+COPY app/ ./
 
 ENV PYTHONUNBUFFERED=1
 
